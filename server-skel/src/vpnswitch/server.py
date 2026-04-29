@@ -31,25 +31,29 @@ class VpnServer:
                 # Aquí podrías añadir lógica de registro si quieres nota extra
 
     def handle_traffic(self, data, addr):
+        # La trama Ethernet empieza después de los 11 bytes de PIXES
         eth_frame = data[self.HEADER_SIZE:]
-        if len(eth_frame) < 14: return # Trama demasiado corta
+        
+        if len(eth_frame) < 14: 
+            return
 
-        # En Ethernet: Destino es bytes 0-6, Origen es bytes 6-12
+        # Extraemos las MACs (6 bytes cada una)
         dst_mac = eth_frame[0:6].hex(":")
         src_mac = eth_frame[6:12].hex(":")
 
-        # Aprendizaje dinámico de MAC (Sección 8.1 del RFC)
+        # 1. APRENDIZAJE: Asociamos la MAC de origen con la dirección UDP del cliente
         if src_mac not in self.mac_table:
-            logger.info(f"Aprendida nueva MAC {src_mac} en dirección {addr}")
+            logger.info(f"Nueva MAC aprendida: {src_mac} -> {addr}")
         self.mac_table[src_mac] = addr
 
-        # Reenvío (Sección 8.2 del RFC)
+        # 2. REENVÍO: ¿Sabemos dónde está el destino?
         if dst_mac in self.mac_table:
             target_addr = self.mac_table[dst_mac]
             self.sock.sendto(data, target_addr)
         else:
+            # Si no sabemos quién es el destino, hacemos FLOOD (enviar a todos)
+            # según la política configurada (self.config.unknown_mac)
             if self.config.unknown_mac == "flood":
-                # Enviar a todos menos al que lo envió
                 for mac, target_addr in self.mac_table.items():
-                    if target_addr != addr:
+                    if target_addr != addr: # No se lo devolvemos al que lo envió
                         self.sock.sendto(data, target_addr)

@@ -181,31 +181,55 @@ static int parse_args(int argc, char *argv[], vpn_config_t *cfg)
 }
 
 void client_run(vpn_config_t *cfg, int tap_fd) {
-    // 1. Crear el socket UDP
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in server_addr;
-    
+    memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(cfg->port);
     inet_pton(AF_INET, cfg->server_ip, &server_addr.sin_addr);
 
-    // 2. Preparar el paquete de Registro (11 bytes)
-    struct pixes_header packet;
-    packet.opcode = OP_REGISTER; // El 1 que hablamos antes
-    packet.cid = htons(cfg->client_id);
-    memset(packet.payload, 0, 8);
+    uint8_t buffer[2048];
+    struct pixes_header *hdr = (struct pixes_header *)buffer;
 
-    printf("Intentando registrar cliente %d en el servidor %s:%d...\n", 
-            cfg->client_id, cfg->server_ip, cfg->port);
+    // Enviar Registro inicial
+    hdr->opcode = 1; // OP_REGISTER
+    hdr->cid = htons(cfg->client_id);
+    memset(hdr->payload, 0, 8);
+    sendto(sock, buffer, 11, 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
 
-    // 3. Enviar el paquete
-    sendto(sock, &packet, sizeof(packet), 0, 
-           (struct sockaddr*)&server_addr, sizeof(server_addr));
+    printf("Cliente %d activo. Pulsa Ctrl+C para salir.\n", cfg->client_id);
 
-    printf("Paquete enviado. Mira la terminal del servidor.\n");
-    
-    // De momento lo paramos aquí para ver si llega
-    while(1) { sleep(1); } 
+    while (1) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(tap_fd, &read_fds);
+        FD_SET(sock, &read_fds);
+
+        int max_fd = (tap_fd > sock) ? tap_fd : sock;
+
+        if (select(max_fd + 1, &read_fds, NULL, NULL, NULL) < 0) {
+            perror("select");
+            break;
+        }
+
+        // SI LLEGA ALGO DEL TAP (como el ping) -> AL SERVIDOR
+        if (FD_ISSET(tap_fd, &read_fds)) {
+            int n = tap_read(tap_fd, buffer + 11, sizeof(buffer) - 11);
+            if (n > 0) {
+                hdr->opcode = 3; // OP_TRAFFIC
+                hdr->cid = htons(cfg->client_id);
+                sendto(sock, buffer, n + 11, 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            }
+        }
+
+        // SI LLEGA ALGO DEL SERVIDOR (UDP) -> AL TAP
+        if (FD_ISSET(sock, &read_fds)) {
+            int n = recvfrom(sock, buffer, sizeof(buffer), 0, NULL, NULL);
+            if (n > 11 && buffer[0] == 3) { // Si es tráfico
+                tap_write(tap_fd, buffer + 11, n - 11);
+            }
+        }
+    }
 }
 
 int main(int argc, char *argv[])
