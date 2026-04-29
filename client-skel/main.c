@@ -14,6 +14,8 @@
 #include <arpa/inet.h>
 #include "protocol.h"
 
+//include para el keepalive
+#include <time.h>
 
 #define KEEPALIVE_INTERVAL_SEC 10
 #define MAX_FRAME_SIZE         65535
@@ -199,37 +201,76 @@ void client_run(vpn_config_t *cfg, int tap_fd) {
 
     printf("Cliente %d activo. Pulsa Ctrl+C para salir.\n", cfg->client_id);
 
+    time_t last_keepalive = 0;
+
     while (1) {
         fd_set read_fds;
+        struct timeval tv;
+
+        // Configuramos el timeout: 1 segundo
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+
         FD_ZERO(&read_fds);
         FD_SET(tap_fd, &read_fds);
         FD_SET(sock, &read_fds);
 
         int max_fd = (tap_fd > sock) ? tap_fd : sock;
 
-        if (select(max_fd + 1, &read_fds, NULL, NULL, NULL) < 0) {
+        // El último argumento es &tv (antes era NULL)
+        int activity = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
+
+        if (activity < 0) {
             perror("select");
             break;
         }
 
-        // SI LLEGA ALGO DEL TAP (como el ping) -> AL SERVIDOR
-        if (FD_ISSET(tap_fd, &read_fds)) {
+        // --- LÓGICA DE KEEPALIVE ---
+        time_t now = time(NULL);
+        if (now - last_keepalive >= 5) {
+            hdr->opcode = 2; // OP_KEEPALIVE según el RFC-31337
+            hdr->cid = htons(cfg->client_id);
+            memset(hdr->payload, 0, 8);
+            
+            sendto(sock, buffer, 11, 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            last_keepalive = now;
+            // Descomenta la siguiente línea para ver si funciona:
+            printf("DEBUG: Keepalive enviado al servidor\n");
+        }
+
+        // --- TRÁFICO DEL TAP ---
+        if (activity > 0 && FD_ISSET(tap_fd, &read_fds)) {
             int n = tap_read(tap_fd, buffer + 11, sizeof(buffer) - 11);
             if (n > 0) {
+                printf("DEBUG: Leyendo %d bytes del TAP y enviando al servidor...\n", n);
                 hdr->opcode = 3; // OP_TRAFFIC
                 hdr->cid = htons(cfg->client_id);
                 sendto(sock, buffer, n + 11, 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
             }
         }
 
-        // SI LLEGA ALGO DEL SERVIDOR (UDP) -> AL TAP
-        if (FD_ISSET(sock, &read_fds)) {
+        // --- TRÁFICO DEL SOCKET ---
+        if (activity > 0 && FD_ISSET(sock, &read_fds)) {
             int n = recvfrom(sock, buffer, sizeof(buffer), 0, NULL, NULL);
-            if (n > 11 && buffer[0] == 3) { // Si es tráfico
+            if (n > 11 && buffer[0] == 3) {
                 tap_write(tap_fd, buffer + 11, n - 11);
             }
         }
     }
+    // 1. Enviar Registro inicial (Ya lo tienes)
+    hdr->opcode = 1; 
+    hdr->cid = htons(cfg->client_id);
+    memset(hdr->payload, 0, 8);
+    sendto(sock, buffer, 11, 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+
+    // 2. NUEVO: Enviar Autenticación (OP_AUTH es 0x01 o según tu protocol.h)
+    // Normalmente es Opcode 2 si el registro es 1, pero revisa protocol.h
+    // Si tu protocol.h dice que AUTH es 4 (por ejemplo), usa ese.
+    hdr->opcode = 4; // Cambia este número según tu protocolo (suele ser 4 o el siguiente al keepalive)
+    memcpy(hdr->payload, cfg->password, 8);
+    sendto(sock, buffer, 11, 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+
+    printf("Cliente %d registrado y autenticado.\n", cfg->client_id);
 }
 
 int main(int argc, char *argv[])
